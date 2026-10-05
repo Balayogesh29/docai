@@ -1,0 +1,222 @@
+import os
+import logging
+from pathlib import Path
+from dotenv import load_dotenv
+
+# Resolve path to backend/.env relative to config.py location
+ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
+load_dotenv(dotenv_path=ENV_PATH)
+
+
+class Settings:
+    """
+    Application Settings configuration container.
+    Gemini is the sole AI provider for all tasks (analysis, outlining, drafting).
+
+    6-Key Split Pool Architecture:
+      ANALYSIS POOL (Keys 1–2):
+        - GEMINI_ANALYSIS_API_KEY    : primary analysis key
+        - GEMINI_ANALYSIS_API_KEY_2  : secondary analysis key (failover)
+      GENERATION POOL (Keys 3–6):
+        - GEMINI_CONTENT_API_KEY     : primary generation key
+        - GEMINI_CONTENT_API_KEY_2   : secondary generation key
+        - GEMINI_API_KEY_5           : tertiary generation key
+        - GEMINI_API_KEY_6           : quaternary generation key
+
+    Falls back to GEMINI_API_KEY if a specific key is not set.
+    Uses OpenAI-compatible endpoint for seamless SDK integration.
+    """
+    BACKEND_HOST: str = os.getenv("BACKEND_HOST", "127.0.0.1")
+    BACKEND_PORT: int = int(os.getenv("BACKEND_PORT", "8000"))
+    FRONTEND_URL: str = os.getenv("FRONTEND_URL", "http://localhost:5173")
+    FIREBASE_PROJECT_ID: str = os.getenv("FIREBASE_PROJECT_ID", "")
+    FIREBASE_STORAGE_BUCKET: str = os.getenv("FIREBASE_STORAGE_BUCKET", "")
+    FIREBASE_SERVICE_ACCOUNT_PATH: str = os.getenv("FIREBASE_SERVICE_ACCOUNT_PATH", "./firebase-service-account.json")
+
+    # ─── Gemini: 6-Key Split Pool ───
+    # Legacy / fallback single key (used if specific keys are absent)
+    GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
+
+    # ANALYSIS POOL — Keys 1-2 (context analysis, project context analysis)
+    GEMINI_ANALYSIS_API_KEY: str = os.getenv("GEMINI_ANALYSIS_API_KEY", "")
+    GEMINI_ANALYSIS_API_KEY_2: str = os.getenv("GEMINI_ANALYSIS_API_KEY_2", "")
+
+    # GENERATION POOL — Keys 3-6 (outline generation, section drafting, regeneration)
+    GEMINI_CONTENT_API_KEY: str = os.getenv("GEMINI_CONTENT_API_KEY", "")
+    GEMINI_CONTENT_API_KEY_2: str = os.getenv("GEMINI_CONTENT_API_KEY_2", "")
+    GEMINI_API_KEY_5: str = os.getenv("GEMINI_API_KEY_5", "")
+    GEMINI_API_KEY_6: str = os.getenv("GEMINI_API_KEY_6", "")
+
+    GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
+    GEMINI_FALLBACK_MODEL: str = os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.5-flash-lite")
+    GEMINI_BASE_URL: str = os.getenv("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/")
+
+    @property
+    def effective_analysis_api_key(self) -> str:
+        """Returns the primary analysis API key, falling back to the generic key."""
+        return (self.GEMINI_ANALYSIS_API_KEY.strip() or self.GEMINI_API_KEY.strip())
+
+    @property
+    def effective_content_api_key(self) -> str:
+        """Returns the primary content generation API key, falling back to the generic key."""
+        return (self.GEMINI_CONTENT_API_KEY.strip() or self.GEMINI_API_KEY.strip())
+
+    @property
+    def effective_content_api_key_2(self) -> str:
+        """Returns the secondary content generation API key, falling back to primary content key."""
+        return (self.GEMINI_CONTENT_API_KEY_2.strip() or self.effective_content_api_key)
+
+    def _is_valid_key(self, key: str) -> bool:
+        return bool(key and key.strip() and key.strip() != "demo_key_placeholder")
+
+    def _build_pool(self, candidates: list) -> list:
+        """Builds a deduplicated, ordered pool from a list of candidate keys."""
+        seen = set()
+        pool = []
+        for key in candidates:
+            stripped = key.strip() if key else ""
+            if stripped and stripped not in seen and self._is_valid_key(stripped):
+                seen.add(stripped)
+                pool.append(stripped)
+        return pool
+
+    # ─── Split Key Pools ───
+
+    @property
+    def analysis_key_pool(self) -> list:
+        """
+        ANALYSIS POOL: Keys 1-2 only.
+        Used exclusively for context analysis and project context analysis.
+        If both analysis keys are exhausted, does NOT spill into generation keys.
+        """
+        return self._build_pool([
+            self.GEMINI_ANALYSIS_API_KEY,
+            self.GEMINI_ANALYSIS_API_KEY_2,
+        ])
+
+    @property
+    def generation_key_pool(self) -> list:
+        """
+        GENERATION POOL: Keys 3-6 only.
+        Used exclusively for outline generation, section drafting, and regeneration.
+        If all generation keys are exhausted, does NOT spill into analysis keys.
+        """
+        return self._build_pool([
+            self.GEMINI_CONTENT_API_KEY,
+            self.GEMINI_CONTENT_API_KEY_2,
+            self.GEMINI_API_KEY_5,
+            self.GEMINI_API_KEY_6,
+        ])
+
+    @property
+    def key_pool(self) -> list:
+        """
+        Combined pool of ALL valid keys (for backward compatibility / diagnostics).
+        """
+        return self._build_pool([
+            self.GEMINI_ANALYSIS_API_KEY,
+            self.GEMINI_ANALYSIS_API_KEY_2,
+            self.GEMINI_CONTENT_API_KEY,
+            self.GEMINI_CONTENT_API_KEY_2,
+            self.GEMINI_API_KEY_5,
+            self.GEMINI_API_KEY_6,
+            self.GEMINI_API_KEY,
+        ])
+
+    # ─── Configuration Checks ───
+
+    @property
+    def is_gemini_configured(self) -> bool:
+        """True if at least one Gemini key (analysis or content or generic) is set."""
+        return (
+            self._is_valid_key(self.GEMINI_ANALYSIS_API_KEY)
+            or self._is_valid_key(self.GEMINI_CONTENT_API_KEY)
+            or self._is_valid_key(self.GEMINI_API_KEY)
+        )
+
+    @property
+    def is_analysis_key_configured(self) -> bool:
+        """True if the dedicated analysis API key is set."""
+        return self._is_valid_key(self.effective_analysis_api_key)
+
+    @property
+    def is_content_key_configured(self) -> bool:
+        """True if the dedicated content generation API key is set."""
+        return self._is_valid_key(self.effective_content_api_key)
+
+    @property
+    def is_content_key_2_configured(self) -> bool:
+        """True if the secondary content generation API key is set."""
+        return self._is_valid_key(self.effective_content_api_key_2)
+
+    @property
+    def is_ai_configured(self) -> bool:
+        """AI is configured if at least one Gemini key is present."""
+        return self.is_gemini_configured
+
+    # Legacy compatibility aliases
+    @property
+    def is_gemini_direct_configured(self) -> bool:
+        return self.is_gemini_configured
+
+    @property
+    def is_groq_configured(self) -> bool:
+        return bool(self.GROQ_API_KEY and self.GROQ_API_KEY.strip() and self.GROQ_API_KEY != "demo_key_placeholder")
+
+    @property
+    def is_openai_configured(self) -> bool:
+        return bool(self.OPENAI_API_KEY and self.OPENAI_API_KEY.strip() and self.OPENAI_API_KEY != "demo_key_placeholder")
+
+    @property
+    def is_mistral_configured(self) -> bool:
+        return bool(self.MISTRAL_API_KEY and self.MISTRAL_API_KEY.strip() and self.MISTRAL_API_KEY != "demo_key_placeholder")
+
+    # ─── Legacy provider keys (kept for backward compatibility, unused) ───
+    GROQ_API_KEY: str = os.getenv("GROQ_API_KEY", "")
+    GROQ_MODEL: str = os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
+    GROQ_BASE_URL: str = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
+    OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
+    OPENAI_MODEL: str = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    MISTRAL_API_KEY: str = os.getenv("MISTRAL_API_KEY", "")
+    MISTRAL_MODEL: str = os.getenv("MISTRAL_MODEL", "mistral-small-latest")
+    MISTRAL_BASE_URL: str = os.getenv("MISTRAL_BASE_URL", "https://api.mistral.ai/v1")
+
+
+settings = Settings()
+
+# ─── Suppress OpenAI SDK's OPENAI_API_KEY auto-detection ───
+# The OpenAI Python SDK reads OPENAI_API_KEY from the environment on import.
+# Since we route all AI calls through Gemini's OpenAI-compatible endpoint,
+# we set the env var to the Gemini key at startup so the SDK never complains.
+# Seed OPENAI_API_KEY env var so the OpenAI SDK never complains about a missing key.
+# Prefer the content key, fall back to analysis key, then generic key.
+_seed_key = settings.effective_content_api_key or settings.effective_analysis_api_key
+if _seed_key and not os.environ.get("OPENAI_API_KEY"):
+    os.environ["OPENAI_API_KEY"] = _seed_key
+
+# Startup diagnostics
+_logger = logging.getLogger("docai.config")
+_logger.info("=== DocAI 6-Key Split Pool Configuration ===")
+_logger.info(f"  Model:              {settings.GEMINI_MODEL}")
+_logger.info(f"  Fallback Model:     {settings.GEMINI_FALLBACK_MODEL}")
+_logger.info(f"  Base URL:           {settings.GEMINI_BASE_URL}")
+_logger.info(f"  ── ANALYSIS POOL (Keys 1-2) ──")
+_logger.info(f"  Analysis key 1:     {settings._is_valid_key(settings.GEMINI_ANALYSIS_API_KEY)}")
+_logger.info(f"  Analysis key 2:     {settings._is_valid_key(settings.GEMINI_ANALYSIS_API_KEY_2)}")
+_logger.info(f"  Analysis pool size: {len(settings.analysis_key_pool)} keys")
+_logger.info(f"  ── GENERATION POOL (Keys 3-6) ──")
+_logger.info(f"  Generation key 3:   {settings._is_valid_key(settings.GEMINI_CONTENT_API_KEY)}")
+_logger.info(f"  Generation key 4:   {settings._is_valid_key(settings.GEMINI_CONTENT_API_KEY_2)}")
+_logger.info(f"  Generation key 5:   {settings._is_valid_key(settings.GEMINI_API_KEY_5)}")
+_logger.info(f"  Generation key 6:   {settings._is_valid_key(settings.GEMINI_API_KEY_6)}")
+_logger.info(f"  Generation pool:    {len(settings.generation_key_pool)} keys")
+_logger.info(f"  ── COMBINED ──")
+_logger.info(f"  Total unique keys:  {len(settings.key_pool)}")
+
+if not settings.is_gemini_configured:
+    _logger.error(
+        "  ✖ No Gemini API key is configured! "
+        "Set GEMINI_ANALYSIS_API_KEY and GEMINI_CONTENT_API_KEY in your .env file. "
+        "Get keys at https://aistudio.google.com/apikey"
+    )
+_logger.info("================================================")

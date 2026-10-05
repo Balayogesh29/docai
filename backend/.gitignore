@@ -1,0 +1,11 @@
+venv/
+.env
+__pycache__/
+*.pyc
+firebase-service-account.json
+*-service-account*.json
+service-account.json
+
+# ─── Generated data (checkpoint recovery + user uploads) ───
+checkpoints/
+uploads/

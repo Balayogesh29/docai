@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+python-dotenv
+firebase-admin
+python-multipart
+pydantic
+openai
+pypdf
+python-docx
+
