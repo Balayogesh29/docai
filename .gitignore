@@ -15,8 +15,11 @@ build/Release/
 
 # ─── Environment / secrets ────────────────────────────────────────────────────
 .env
+.env.*
+*.env
 .env.local
 .env.*.local
+!.env.example
 
 # ─── Python ───────────────────────────────────────────────────────────────────
 __pycache__/
@@ -25,6 +28,9 @@ __pycache__/
 venv/
 .venv/
 *.egg-info/
+checkpoints/
+uploads/
+
 
 # ─── Firebase ─────────────────────────────────────────────────────────────────
 .firebase/
@@ -46,6 +52,9 @@ Thumbs.db
 *.njsproj
 *.sln
 *.sw?
+.agents/
+.claude/
+
 
 # ─── Logs & Coverage ──────────────────────────────────────────────────────────
 logs/
