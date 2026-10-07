@@ -4,9 +4,11 @@ import json
 import html
 import time
 import logging
-import uuid
+# uuid removed — session IDs are now deterministic hashes
+import hashlib
 from typing import List, Optional, Union, Any
 from pathlib import Path
+from datetime import datetime, timezone
 
 from app.config import settings
 
@@ -61,20 +63,37 @@ logger = logging.getLogger("docai.ai_service")
 UPLOADS_BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "uploads"))
 
 
-# ─── Checkpoint Helpers ───
-# Saves intermediate pipeline state as JSON after each step/section so that
-# if an API key is exhausted mid-pipeline, execution can resume from the
-# last successful checkpoint with the next available key.
+# ─── Deterministic Session ID Helpers ───
+# Generate session IDs from user ID + request content so:
+# 1) Two users NEVER share a checkpoint folder.
+# 2) Changed inputs hash to a fresh session ID, preventing stale cache reuse.
 
-def _checkpoint_save(session_id: str, step_name: str, data: Any) -> str:
+def _deterministic_session_id(prefix: str, user_id: Optional[str] = None, *args: str) -> str:
     """
-    Saves a checkpoint JSON file for a given pipeline session and step.
-    Returns the path to the saved checkpoint file.
+    Creates a deterministic, stable session ID from user ID and request content.
+    The same inputs always produce the same session_id, enabling cross-retry resume.
+    Different user IDs or modified request parameters produce distinct session IDs.
+    """
+    uid = str(user_id or "anonymous").strip()
+    combined = "|".join([uid] + [str(a) for a in args if a is not None])
+    digest = hashlib.sha256(combined.encode("utf-8")).hexdigest()[:12]
+    return f"{prefix}-{uid}-{digest}"
+
+
+# ─── Checkpoint Helpers ───
+# Saves intermediate pipeline state as JSON after each step/section. Writes atomically
+# using a temporary file. Never stores raw API key values (only 1-based key numbers).
+
+def _checkpoint_save(session_id: str, step_name: str, data: Any,
+                     api_pool: str = "", api_key_index: int = -1, status: str = "completed") -> str:
+    """
+    Atomically saves a checkpoint JSON file for a given pipeline session and step.
+    Writes to a temporary .tmp file first, then atomically renames to .json.
+    Key index stored in metadata is 1-based (Key 1..N).
     """
     session_dir = CHECKPOINTS_DIR / session_id
     session_dir.mkdir(parents=True, exist_ok=True)
 
-    # Serialize Pydantic models to dict
     if hasattr(data, "model_dump"):
         serializable = data.model_dump()
     elif hasattr(data, "dict"):
@@ -82,23 +101,34 @@ def _checkpoint_save(session_id: str, step_name: str, data: Any) -> str:
     else:
         serializable = data
 
-    checkpoint_file = session_dir / f"{step_name}.json"
-    with open(checkpoint_file, "w", encoding="utf-8") as f:
-        json.dump({
-            "session_id": session_id,
-            "step": step_name,
-            "timestamp": time.time(),
-            "data": serializable,
-        }, f, indent=2, ensure_ascii=False, default=str)
+    # 1-based key number for metadata (Key 1, Key 2, etc.)
+    key_num = api_key_index + 1 if api_key_index >= 0 else api_key_index
 
-    logger.info(f"[Checkpoint] Saved: {step_name} → {checkpoint_file}")
-    return str(checkpoint_file)
+    temp_file = session_dir / f"{step_name}.tmp"
+    final_file = session_dir / f"{step_name}.json"
+    payload = {
+        "session_id": session_id,
+        "step": step_name,
+        "status": status,
+        "api_pool": api_pool,
+        "api_key_index": key_num,
+        "completed_at": datetime.now(timezone.utc).isoformat(),
+        "timestamp": time.time(),
+        "data": serializable,
+    }
+
+    with open(temp_file, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False, default=str)
+
+    temp_file.replace(final_file)
+    logger.info(f"[Checkpoint] Saved: {step_name} → {final_file} (status={status})")
+    return str(final_file)
 
 
 def _checkpoint_load(session_id: str, step_name: str) -> Optional[dict]:
     """
-    Loads a checkpoint JSON file for a given session and step.
-    Returns the data dict if found, else None.
+    Loads a checkpoint JSON file for a given session and step ONLY if status == 'completed'.
+    If status != 'completed', or if the JSON file is unreadable/corrupt, returns None without crashing.
     """
     checkpoint_file = CHECKPOINTS_DIR / session_id / f"{step_name}.json"
     if not checkpoint_file.exists():
@@ -107,19 +137,85 @@ def _checkpoint_load(session_id: str, step_name: str) -> Optional[dict]:
     try:
         with open(checkpoint_file, "r", encoding="utf-8") as f:
             payload = json.load(f)
+
+        if not isinstance(payload, dict):
+            logger.warning(f"[Checkpoint] File {checkpoint_file} does not contain a valid JSON dict.")
+            return None
+
+        if payload.get("status") != "completed":
+            logger.info(f"[Checkpoint] Step {step_name} in {session_id} has status='{payload.get('status')}' (not completed). Treating as incomplete.")
+            return None
+
         logger.info(f"[Checkpoint] Loaded: {step_name} ← {checkpoint_file}")
         return payload.get("data")
     except Exception as e:
-        logger.warning(f"[Checkpoint] Failed to load {checkpoint_file}: {e}")
+        logger.warning(f"[Checkpoint] Unreadable or corrupt JSON file {checkpoint_file}: {e}")
         return None
 
 
+def _checkpoint_load_full(session_id: str, step_name: str) -> Optional[dict]:
+    """
+    Loads the full checkpoint envelope ONLY if status == 'completed'.
+    If corrupt or status != 'completed', returns None without crashing.
+    """
+    checkpoint_file = CHECKPOINTS_DIR / session_id / f"{step_name}.json"
+    if not checkpoint_file.exists():
+        return None
+
+    try:
+        with open(checkpoint_file, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        if isinstance(payload, dict) and payload.get("status") == "completed":
+            return payload
+        return None
+    except Exception as e:
+        logger.warning(f"[Checkpoint] Unreadable or corrupt full checkpoint {checkpoint_file}: {e}")
+        return None
+
+
+def _get_session_key_index(session_id: str, pool_name: str, pool_len: int) -> int:
+    """
+    Reads the most recent completed checkpoint for session_id to retrieve the last working key index (0-based).
+    Persists key state per-session on disk so server restarts or multiple users never interfere.
+    Returns 0 if no checkpoint exists or if invalid.
+    """
+    if pool_len <= 0 or not session_id:
+        return 0
+    session_dir = CHECKPOINTS_DIR / session_id
+    if not session_dir.exists():
+        return 0
+
+    latest_ts = -1.0
+    last_key_idx = 0
+    for fpath in session_dir.glob("*.json"):
+        try:
+            with open(fpath, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            if isinstance(payload, dict) and payload.get("status") == "completed":
+                p_pool = str(payload.get("api_pool", "")).lower()
+                if p_pool == pool_name.lower():
+                    ts = payload.get("timestamp", 0.0)
+                    if ts > latest_ts:
+                        latest_ts = ts
+                        k = payload.get("api_key_index", 1)
+                        # k is 1-based key number; convert back to 0-based index
+                        if isinstance(k, int) and 1 <= k <= pool_len:
+                            last_key_idx = k - 1
+        except Exception:
+            continue
+    return last_key_idx
+
+
 def _checkpoint_list(session_id: str) -> List[str]:
-    """Lists all checkpoint step names for a session."""
+    """Lists all completed checkpoint step names for a session."""
     session_dir = CHECKPOINTS_DIR / session_id
     if not session_dir.exists():
         return []
-    return sorted([f.stem for f in session_dir.glob("*.json")])
+    completed_steps = []
+    for f in session_dir.glob("*.json"):
+        if _checkpoint_load(session_id, f.stem) is not None:
+            completed_steps.append(f.stem)
+    return sorted(completed_steps)
 
 
 def _checkpoint_cleanup(session_id: str):
@@ -220,6 +316,38 @@ def get_reference_files_context(user_id: str, file_ids: List[str]) -> str:
     return "\n\n".join(extracted_texts)
 
 
+# ─── Helper: classify Gemini errors as rotatable ───
+
+def _is_rotatable_error(exc: Exception) -> bool:
+    """Returns True if the error should trigger key rotation within a pool."""
+    status_code = getattr(exc, "status_code", getattr(exc, "status", None))
+    error_body = getattr(exc, "body", getattr(exc, "message", str(exc)))
+    error_str = str(error_body).lower() if error_body else ""
+
+    return (
+        status_code == 429
+        or status_code in (401, 403)
+        or "quota" in error_str
+        or "rate limit" in error_str
+        or "resource exhausted" in error_str
+        or "limit" in error_str
+    )
+
+
+def _is_quota_error(exc: Exception) -> bool:
+    """Returns True if the error is specifically a quota/rate-limit exhaustion."""
+    status_code = getattr(exc, "status_code", getattr(exc, "status", None))
+    error_body = getattr(exc, "body", getattr(exc, "message", str(exc)))
+    error_str = str(error_body).lower() if error_body else ""
+
+    return (
+        status_code == 429
+        or "quota" in error_str
+        or "rate limit" in error_str
+        or "resource exhausted" in error_str
+    )
+
+
 class AIService:
     """
     Gemini-Powered AI Service:
@@ -227,33 +355,23 @@ class AIService:
     through Google Gemini via the OpenAI-compatible endpoint.
 
     Features:
-    - Aggressive retry with exponential backoff (5 retries, 2s → 4s → 8s → 16s → 32s)
-    - Automatic fallback to GEMINI_FALLBACK_MODEL on persistent 503/overloaded errors
+    - Aggressive retry with exponential backoff (5 retries, 2s -> 4s -> 8s -> 16s -> 32s)
     - Clean, unified client management
+    - Checkpoint-based recovery with deterministic session IDs (includes user_id)
+    - Two independent key pools: Analysis (2 keys) and Content (4 keys)
+    - Per-session key state (derived from checkpoint metadata, not in-memory globals)
+    - No fallback model: when all keys in a pool are exhausted, stop cleanly and raise
     """
 
-    # ─── Model Properties ───
+    def __init__(self):
+        """No instance-level key state. Key indices are per-session via checkpoint metadata."""
+        pass
+
+    # --- Model Properties ---
 
     @property
     def gemini_model(self) -> str:
         return settings.GEMINI_MODEL
-
-    @property
-    def gemini_fallback_model(self) -> str:
-        return settings.GEMINI_FALLBACK_MODEL
-
-    # Legacy aliases for backward compatibility
-    @property
-    def groq_model(self) -> str:
-        return self.gemini_model
-
-    @property
-    def openai_model(self) -> str:
-        return self.gemini_model
-
-    @property
-    def mistral_model(self) -> str:
-        return self.gemini_model
 
     @property
     def model(self) -> str:
@@ -301,43 +419,11 @@ class AIService:
             base_url=settings.GEMINI_BASE_URL,
         )
 
-    def get_content_client_secondary(self) -> OpenAI:
-        """
-        Returns an OpenAI SDK client for content generation tasks using the secondary content API key.
-        Used as fallback when primary content key fails.
-        """
-        if not settings.is_content_key_2_configured:
-            raise ValueError(
-                "Gemini Secondary Content API key is not configured. "
-                "Set GEMINI_CONTENT_API_KEY_2 in your .env file."
-            )
-        logger.info(
-            f"[Gemini Content Client] Using secondary content key | "
-            f"Model: {settings.GEMINI_MODEL} | Base URL: {settings.GEMINI_BASE_URL}"
-        )
-        return OpenAI(
-            api_key=settings.effective_content_api_key_2,
-            base_url=settings.GEMINI_BASE_URL,
-        )
-
     def get_gemini_openai_client(self) -> OpenAI:
         """
         Legacy compatibility method — routes to content client by default.
         """
         return self.get_content_client()
-
-    # Legacy client methods — all route to Gemini now
-    def get_groq_client(self) -> OpenAI:
-        """Legacy alias — routes to Gemini."""
-        return self.get_gemini_openai_client()
-
-    def get_openai_client(self) -> OpenAI:
-        """Legacy alias — routes to Gemini."""
-        return self.get_gemini_openai_client()
-
-    def get_mistral_client(self) -> Any:
-        """Legacy alias — routes to Gemini."""
-        return self.get_gemini_openai_client()
 
     def get_gemini_client(self):
         """Returns native google.genai Client for Gemini (used for visual/diagram features)."""
@@ -374,18 +460,17 @@ class AIService:
         stage: str = "request",
         use_json_mode: bool = False,
         start_key_index: int = 0,
-        _is_fallback_attempt: bool = False,
-    ) -> str:
+    ) -> tuple:
         """
         Core rotation engine: iterates through a specific key pool.
         For each key, runs _chat_completion with full retry. On 429/quota/auth,
         catches the exception and advances to next key in the pool.
 
-        FALLBACK BEHAVIOR: If ALL keys in the pool are exhausted with 429/quota
-        errors on the primary model, automatically retries the entire pool using
-        GEMINI_FALLBACK_MODEL before giving up. This handles free-tier daily
-        quota limits (e.g. 20 req/day/project/model) where switching keys
-        doesn't help but switching models does (each model has its own quota).
+        Returns a tuple of (result_text, key_index_used) so callers can track
+        which key succeeded for checkpoint metadata.
+
+        NO FALLBACK MODEL: When all keys in the pool are exhausted, stops cleanly,
+        preserves all checkpoints, and raises so the process can be resumed later.
         """
         if not pool:
             raise ValueError(
@@ -394,7 +479,6 @@ class AIService:
             )
 
         last_exception = None
-        all_quota_exhausted = True  # Track if every failure was quota-related
         for offset in range(len(pool)):
             key_index = (start_key_index + offset) % len(pool)
             key = pool[key_index]
@@ -415,101 +499,31 @@ class AIService:
                     stage=f"{stage}_{pool_name.lower()}_key{key_index + 1}",
                     use_json_mode=use_json_mode,
                 )
-                return result
+                return (result, key_index)
 
             except Exception as e:
                 last_exception = e
-                status_code = getattr(e, "status_code", getattr(e, "status", None))
-                error_body = getattr(e, "body", getattr(e, "message", str(e)))
-                error_str = str(error_body).lower() if error_body else ""
 
-                is_quota = (
-                    status_code == 429
-                    or "quota" in error_str
-                    or "rate limit" in error_str
-                    or "resource exhausted" in error_str
-                )
-                is_rotatable = (
-                    is_quota
-                    or status_code in (401, 403)
-                    or "limit" in error_str
-                )
-
-                if not is_quota:
-                    all_quota_exhausted = False
-
-                if is_rotatable and offset < len(pool) - 1:
+                if _is_rotatable_error(e) and offset < len(pool) - 1:
                     logger.warning(
                         f"[{pool_name}] Key {key_index + 1} exhausted "
-                        f"(status={status_code}), rotating to next key..."
+                        f"(status={getattr(e, 'status_code', '?')}), rotating to next key..."
                     )
                     continue
                 else:
-                    # All keys exhausted — check if we should try fallback model
-                    fallback_model = self.gemini_fallback_model
-                    if (
-                        all_quota_exhausted
-                        and not _is_fallback_attempt
-                        and fallback_model
-                        and fallback_model != model
-                    ):
-                        logger.warning(
-                            f"[{pool_name}] All {len(pool)} keys exhausted with quota errors "
-                            f"on model '{model}'. Retrying entire pool with fallback model "
-                            f"'{fallback_model}' for stage '{stage}'..."
-                        )
-                        return self._rotate_through_pool(
-                            pool=pool,
-                            pool_name=pool_name,
-                            model=fallback_model,
-                            messages=messages,
-                            temperature=temperature,
-                            max_retries=max_retries,
-                            stage=stage,
-                            use_json_mode=use_json_mode,
-                            start_key_index=0,
-                            _is_fallback_attempt=True,
-                        )
-
                     logger.error(
                         f"[{pool_name}] All {len(pool)} keys exhausted or "
                         f"non-rotatable error for stage '{stage}': {e}"
                     )
                     raise
 
-        # Reached end of pool without success — try fallback model
-        fallback_model = self.gemini_fallback_model
-        if (
-            all_quota_exhausted
-            and not _is_fallback_attempt
-            and fallback_model
-            and fallback_model != model
-            and last_exception
-        ):
-            logger.warning(
-                f"[{pool_name}] All {len(pool)} keys quota-exhausted on model '{model}'. "
-                f"Falling back to '{fallback_model}' for stage '{stage}'..."
-            )
-            return self._rotate_through_pool(
-                pool=pool,
-                pool_name=pool_name,
-                model=fallback_model,
-                messages=messages,
-                temperature=temperature,
-                max_retries=max_retries,
-                stage=stage,
-                use_json_mode=use_json_mode,
-                start_key_index=0,
-                _is_fallback_attempt=True,
-            )
-
         if last_exception:
             raise last_exception
         raise Exception(f"All {len(pool)} {pool_name} keys exhausted for stage '{stage}'")
 
-    # ─── Core Chat Completion (used by _rotate_through_pool) ───
-    # Executes one API call with exponential backoff, model fallback on 503,
-    # and clean propagation of non-retryable errors (404, 401, 403, 400, 422).
+    # --- Core Chat Completion (used by _rotate_through_pool) ---
+    # Executes one API call with exponential backoff.
+    # No fallback model. Non-retryable errors propagate immediately.
 
     def _chat_completion(
         self,
@@ -525,34 +539,18 @@ class AIService:
         Executes chat completion via Gemini's OpenAI-compatible endpoint.
 
         Retry strategy:
-          - Max 5 attempts with exponential backoff (2s → 4s → 8s → 16s → 32s)
-          - After 3 consecutive 503/overloaded failures on primary model,
-            auto-falls back to GEMINI_FALLBACK_MODEL for remaining retries
+          - Max 5 attempts with exponential backoff (2s -> 4s -> 8s -> 16s -> 32s)
           - Non-retryable errors (404, 401, 403, 400, 422) raise immediately
           - Rate-limit / quota errors are propagated to _rotate_through_pool
             so the next key in the pool is tried
+          - No fallback model switching
         """
         last_exception = None
-        current_model = model
-        primary_failures = 0
 
         for attempt in range(1, max_retries + 1):
             try:
-                # Auto-fallback to smaller model after 3 consecutive 503/overloaded
-                if (
-                    primary_failures >= 3
-                    and current_model == model
-                    and self.gemini_fallback_model != model
-                ):
-                    current_model = self.gemini_fallback_model
-                    logger.warning(
-                        f"[Gemini] Switching to fallback model '{current_model}' "
-                        f"after {primary_failures} overload failures on '{model}' "
-                        f"[stage={stage}]"
-                    )
-
                 kwargs = dict(
-                    model=current_model,
+                    model=model,
                     messages=messages,
                     temperature=temperature,
                 )
@@ -577,55 +575,37 @@ class AIService:
 
                 logger.warning(
                     f"[Gemini] {stage} attempt {attempt}/{max_retries} failed. "
-                    f"Model: {current_model}, Status: {status_code}, "
+                    f"Model: {model}, Status: {status_code}, "
                     f"Error: {type(e).__name__}: {error_body}"
                 )
 
-                # ── Non-retryable: propagate immediately ──
+                # -- Non-retryable: propagate immediately --
                 if status_code == 404:
                     raise ValueError(
-                        f"Model '{current_model}' not found on Gemini API. "
+                        f"Model '{model}' not found on Gemini API. "
                         f"Verify the model name. Original error: {error_body}"
                     ) from e
 
                 if status_code in (401, 403):
-                    # Let _rotate_through_pool catch auth failures so it can
-                    # switch to the next key.
                     raise
 
                 if status_code in (400, 422):
                     raise ValueError(
-                        f"Invalid request for model '{current_model}'. "
+                        f"Invalid request for model '{model}'. "
                         f"The API rejected the request payload. "
                         f"Original error: {error_body}"
                     ) from e
 
-                # ── Rate-limit / quota: propagate immediately so pool rotates ──
-                is_quota = (
-                    status_code == 429
-                    or "quota" in error_str
-                    or "rate limit" in error_str
-                    or "resource exhausted" in error_str
-                )
-                if is_quota:
-                    # Do not sleep — let _rotate_through_pool switch keys immediately
+                # -- Rate-limit / quota: propagate so pool rotates --
+                if _is_quota_error(e):
                     raise
 
-                # ── Transient / overloaded: track for fallback, then backoff ──
-                is_overloaded = (
-                    status_code == 503
-                    or "overloaded" in error_str
-                    or "server is busy" in error_str
-                )
-                if is_overloaded and current_model == model:
-                    primary_failures += 1
-
-                # Exponential backoff: 2s, 4s, 8s, 16s, 32s
+                # -- Transient / overloaded: backoff --
                 if attempt < max_retries:
                     sleep_time = 2 ** attempt
                     logger.info(
                         f"[Gemini] Retrying in {sleep_time}s... "
-                        f"(attempt {attempt}/{max_retries}, model: {current_model})"
+                        f"(attempt {attempt}/{max_retries}, model: {model})"
                     )
                     time.sleep(sleep_time)
 
@@ -641,14 +621,19 @@ class AIService:
         max_retries: int = 5,
         stage: str = "analysis",
         use_json_mode: bool = False,
-    ) -> str:
+        session_id: str = "",
+    ) -> tuple:
         """
         Routes through ANALYSIS POOL (Keys 1-2) only.
         Used for: context analysis, project context analysis.
         Will NOT borrow generation keys.
+        Key start index is loaded per-session from checkpoint metadata.
+        Returns (result_text, key_index_used).
         """
-        return self._rotate_through_pool(
-            pool=settings.analysis_key_pool,
+        pool = settings.analysis_key_pool
+        start_idx = _get_session_key_index(session_id, "analysis", len(pool)) if session_id else 0
+        result, key_idx = self._rotate_through_pool(
+            pool=pool,
             pool_name="Analysis Pool",
             model=model,
             messages=messages,
@@ -656,7 +641,9 @@ class AIService:
             max_retries=max_retries,
             stage=stage,
             use_json_mode=use_json_mode,
+            start_key_index=start_idx,
         )
+        return (result, key_idx)
 
     def _generation_rotation(
         self,
@@ -666,14 +653,19 @@ class AIService:
         max_retries: int = 5,
         stage: str = "generation",
         use_json_mode: bool = False,
-    ) -> str:
+        session_id: str = "",
+    ) -> tuple:
         """
-        Routes through GENERATION POOL (Keys 3-6) only.
+        Routes through GENERATION POOL (Content Keys 1-4) only.
         Used for: outline generation, section drafting, regeneration.
         Will NOT borrow analysis keys.
+        Key start index is loaded per-session from checkpoint metadata.
+        Returns (result_text, key_index_used).
         """
-        return self._rotate_through_pool(
-            pool=settings.generation_key_pool,
+        pool = settings.generation_key_pool
+        start_idx = _get_session_key_index(session_id, "content", len(pool)) if session_id else 0
+        result, key_idx = self._rotate_through_pool(
+            pool=pool,
             pool_name="Generation Pool",
             model=model,
             messages=messages,
@@ -681,16 +673,20 @@ class AIService:
             max_retries=max_retries,
             stage=stage,
             use_json_mode=use_json_mode,
+            start_key_index=start_idx,
         )
+        return (result, key_idx)
 
     # Backward-compatible aliases
     def _chat_completion_with_key_rotation(self, **kwargs) -> str:
-        """Legacy alias — routes to generation pool by default."""
-        return self._generation_rotation(**kwargs)
+        """Legacy alias — routes to generation pool by default. Returns just text."""
+        result, _ = self._generation_rotation(**kwargs)
+        return result
 
     def _chat_completion_with_content_fallback(self, **kwargs) -> str:
-        """Legacy alias — routes to generation pool."""
-        return self._generation_rotation(**kwargs)
+        """Legacy alias — routes to generation pool. Returns just text."""
+        result, _ = self._generation_rotation(**kwargs)
+        return result
 
     # ─── Helper ───
 
@@ -706,7 +702,8 @@ class AIService:
     ) -> ContextAnalysisResponse:
         """
         Analyzes topic, abstract, and uploaded reference files to extract structured paper metadata using Gemini.
-        Uses key rotation through the full API key pool with try-catch failover.
+        Uses deterministic session ID for checkpoint-based recovery.
+        Uses key rotation through the ANALYSIS key pool with try-catch failover.
         """
         ref_context = ""
         if user_id and request.reference_file_ids:
@@ -729,19 +726,32 @@ class AIService:
             "\nPlease analyze the above input and extract structured project information in JSON format matching the required schema."
         )
 
+        # -- Deterministic session ID from user_id + request content --
+        session_id = _deterministic_session_id(
+            "ctx", user_id, request.topic, request.doc_type, request.abstract or ""
+        )
+
+        # ── Check for existing completed checkpoint ──
+        cached_result = _checkpoint_load(session_id, "02_context_analysis_result")
+        if cached_result:
+            logger.info(f"[Analysis Resume] Session {session_id} | Reusing cached result")
+            try:
+                return ContextAnalysisResponse(**cached_result)
+            except Exception:
+                logger.warning("[Analysis Resume] Cached result invalid, regenerating...")
+
         # ── Checkpoint: save input so recovery can reconstruct context ──
-        session_id = str(uuid.uuid4())[:12]
         _checkpoint_save(session_id, "01_input", {
             "topic": request.topic,
             "doc_type": request.doc_type,
             "abstract": request.abstract or "",
             "has_reference_files": bool(request.reference_file_ids),
-        })
+        }, api_pool="analysis")
         logger.info(f"[Analysis Checkpoint] Session {session_id} | Step 01_input saved")
 
         try:
             # ── Use ANALYSIS POOL (keys 1-2) only ──
-            raw_content = self._analysis_rotation(
+            raw_content, key_idx = self._analysis_rotation(
                 model=self.gemini_model,
                 messages=[
                     {"role": "system", "content": system_instruction},
@@ -751,6 +761,7 @@ class AIService:
                 max_retries=5,
                 stage="context_analysis",
                 use_json_mode=True,
+                session_id=session_id,
             )
 
             if not raw_content:
@@ -764,20 +775,20 @@ class AIService:
                 "core_objectives": result.core_objectives,
                 "key_concepts": result.key_concepts,
                 "target_audience": result.target_audience,
-            })
+            }, api_pool="analysis", api_key_index=key_idx)
             logger.info(f"[Analysis Checkpoint] Session {session_id} | Step 02_context_analysis_result saved")
 
             return result
 
         except (APIError, RateLimitError, AuthenticationError) as oe:
-            _checkpoint_save(session_id, "failure_context_analysis", {"error": str(oe)})
+            _checkpoint_save(session_id, "failure_context_analysis", {"error": str(oe)}, api_pool="analysis", status="failed")
             logger.error(f"[AI Context Analysis Error]: {oe}", exc_info=True)
             raise oe
         except ValidationError as ve:
             logger.error(f"[AI Context Analysis Error] Pydantic validation error: {ve}", exc_info=True)
             raise RuntimeError(f"Failed to parse AI output into valid ContextAnalysisResponse: {ve}")
         except Exception as e:
-            _checkpoint_save(session_id, "failure_context_analysis", {"error": str(e)})
+            _checkpoint_save(session_id, "failure_context_analysis", {"error": str(e)}, api_pool="analysis", status="failed")
             logger.error(f"[AI Context Analysis Error]: {e}", exc_info=True)
             raise e
 
@@ -791,7 +802,12 @@ class AIService:
         """
         Analyzes title, domains, abstract, additional context, and reference materials for a Project Report
         using Gemini in strict JSON mode to extract structured context analysis.
-        Uses key rotation through the full API key pool with try-catch failover.
+
+        CHECKPOINT RECOVERY:
+        - Uses deterministic session_id derived from request content
+        - Checks for existing completed checkpoint before calling the API
+        - Saves granular checkpoints after each analysis step
+        - On retry, loads existing checkpoints and skips completed steps
         """
         ref_context = ""
         if user_id and request.reference_file_ids:
@@ -814,6 +830,30 @@ class AIService:
         )
 
         # ─────────────────────────────────────────────────────────────────────
+        # DETERMINISTIC SESSION ID
+        # Same request content → same session_id → resume from checkpoints
+        # ─────────────────────────────────────────────────────────────────────
+        session_id = _deterministic_session_id(
+            "prj", user_id, request.title, ",".join(request.domains),
+            request.abstract or "", request.additional_context or ""
+        )
+
+        # ─────────────────────────────────────────────────────────────────────
+        # CHECK FOR EXISTING COMPLETED RESULT
+        # If the full structured context was already saved, return it directly.
+        # ─────────────────────────────────────────────────────────────────────
+        cached_full = _checkpoint_load(session_id, "08_structured_context")
+        if cached_full:
+            logger.info(
+                f"[Analysis Resume] Session {session_id} | "
+                f"Reusing completed 08_structured_context checkpoint"
+            )
+            try:
+                return ProjectReportContextAnalysisResponse(**cached_full)
+            except Exception as ex:
+                logger.warning(f"[Analysis Resume] Cached full result invalid ({ex}), regenerating...")
+
+        # ─────────────────────────────────────────────────────────────────────
         # GRANULAR CHECKPOINT PIPELINE
         # Every named step is persisted as its own JSON file immediately after
         # completion. Key rotation resumes from the last successful step file
@@ -828,29 +868,30 @@ class AIService:
         #   07_components              ← key_terms / technologies_and_methods
         #   08_structured_context      ← full validated response dict
         # ─────────────────────────────────────────────────────────────────────
-        session_id = str(uuid.uuid4())[:12]
 
         # Step 01 — raw input
-        _checkpoint_save(session_id, "01_input", {
-            "title": request.title,
-            "domains": request.domains,
-            "abstract": request.abstract or "",
-            "additional_context": request.additional_context or "",
-            "has_reference_files": bool(request.reference_file_ids),
-        })
-        logger.info(f"[Analysis Checkpoint] Session {session_id} | 01_input saved")
+        if not _checkpoint_load(session_id, "01_input"):
+            _checkpoint_save(session_id, "01_input", {
+                "title": request.title,
+                "domains": request.domains,
+                "abstract": request.abstract or "",
+                "additional_context": request.additional_context or "",
+                "has_reference_files": bool(request.reference_file_ids),
+            }, api_pool="analysis")
+            logger.info(f"[Analysis Checkpoint] Session {session_id} | 01_input saved")
 
         # Step 02 — project understanding summary
-        _checkpoint_save(session_id, "02_project_understanding", {
-            "title": request.title,
-            "domains": request.domains,
-            "abstract_preview": (request.abstract or "")[:300],
-        })
-        logger.info(f"[Analysis Checkpoint] Session {session_id} | 02_project_understanding saved")
+        if not _checkpoint_load(session_id, "02_project_understanding"):
+            _checkpoint_save(session_id, "02_project_understanding", {
+                "title": request.title,
+                "domains": request.domains,
+                "abstract_preview": (request.abstract or "")[:300],
+            }, api_pool="analysis")
+            logger.info(f"[Analysis Checkpoint] Session {session_id} | 02_project_understanding saved")
 
         try:
             # ── Use ANALYSIS POOL (keys 1-2) only ──
-            raw_content = self._analysis_rotation(
+            raw_content, key_idx = self._analysis_rotation(
                 model=self.gemini_model,
                 messages=[
                     {"role": "system", "content": system_instruction},
@@ -860,6 +901,7 @@ class AIService:
                 max_retries=5,
                 stage="project_context_analysis",
                 use_json_mode=True,
+                session_id=session_id,
             )
 
             if not raw_content:
@@ -876,27 +918,27 @@ class AIService:
                 "domain": result.domain if hasattr(result, "domain") else [],
                 "domains": result.domains if hasattr(result, "domains") else [],
                 "key_terms": result.key_terms if hasattr(result, "key_terms") else [],
-            })
+            }, api_pool="analysis", api_key_index=key_idx)
             logger.info(f"[Analysis Checkpoint] Session {session_id} | 03_domain_analysis saved")
 
             # Step 04 — objectives
             _checkpoint_save(session_id, "04_objectives", {
                 "objectives": result.objectives if hasattr(result, "objectives") else [],
                 "core_objectives": result.core_objectives if hasattr(result, "core_objectives") else [],
-            })
+            }, api_pool="analysis", api_key_index=key_idx)
             logger.info(f"[Analysis Checkpoint] Session {session_id} | 04_objectives saved")
 
             # Step 05 — requirements
             _checkpoint_save(session_id, "05_requirements", {
                 "functional_requirements": result.functional_requirements if hasattr(result, "functional_requirements") else [],
-            })
+            }, api_pool="analysis", api_key_index=key_idx)
             logger.info(f"[Analysis Checkpoint] Session {session_id} | 05_requirements saved")
 
             # Step 06 — methodology
             _checkpoint_save(session_id, "06_methodology", {
                 "methodology_summary": result.methodology_summary if hasattr(result, "methodology_summary") else "",
                 "proposed_solution": result.proposed_solution if hasattr(result, "proposed_solution") else "",
-            })
+            }, api_pool="analysis", api_key_index=key_idx)
             logger.info(f"[Analysis Checkpoint] Session {session_id} | 06_methodology saved")
 
             # Step 07 — components / technologies
@@ -904,12 +946,13 @@ class AIService:
                 "technologies_and_methods": result.technologies_and_methods if hasattr(result, "technologies_and_methods") else [],
                 "technologies_and_tools": result.technologies_and_tools if hasattr(result, "technologies_and_tools") else [],
                 "key_terms": result.key_terms if hasattr(result, "key_terms") else [],
-            })
+            }, api_pool="analysis", api_key_index=key_idx)
             logger.info(f"[Analysis Checkpoint] Session {session_id} | 07_components saved")
 
             # Step 08 — full structured context (source of truth for resume)
             result_dict = result.model_dump() if hasattr(result, "model_dump") else result.dict()
-            _checkpoint_save(session_id, "08_structured_context", result_dict)
+            _checkpoint_save(session_id, "08_structured_context", result_dict,
+                             api_pool="analysis", api_key_index=key_idx)
             logger.info(
                 f"[Analysis Checkpoint] Session {session_id} | 08_structured_context saved "
                 f"| All 8 steps complete"
@@ -918,15 +961,15 @@ class AIService:
             return result
 
         except (APIError, RateLimitError, AuthenticationError) as oe:
-            _checkpoint_save(session_id, "failure_project_context", {"error": str(oe)})
+            _checkpoint_save(session_id, "failure_project_context", {"error": str(oe)}, api_pool="analysis", status="failed")
             logger.error(f"[AI Project Context Error]: {oe}", exc_info=True)
             raise oe
         except ValidationError as ve:
-            _checkpoint_save(session_id, "failure_project_context", {"error": str(ve)})
+            _checkpoint_save(session_id, "failure_project_context", {"error": str(ve)}, api_pool="analysis", status="failed")
             logger.error(f"[AI Project Context Error] Pydantic validation error: {ve}", exc_info=True)
             raise RuntimeError(f"Failed to parse AI output into valid ContextAnalysisResponse: {ve}")
         except Exception as e:
-            _checkpoint_save(session_id, "failure_project_context", {"error": str(e)})
+            _checkpoint_save(session_id, "failure_project_context", {"error": str(e)}, api_pool="analysis", status="failed")
             logger.error(f"[AI Project Context Error]: {e}", exc_info=True)
             raise e
 
@@ -934,12 +977,13 @@ class AIService:
 
     def generate_project_report_outline(
         self,
-        request: ProjectReportOutlineRequest
+        request: ProjectReportOutlineRequest,
+        user_id: Optional[str] = None,
     ) -> ProjectReportOutlineResponse:
         """
         Generates an adapted, non-rigid document outline for a Project Report based on analyzed context using Gemini.
         Enforces DOM-friendly section IDs, sequential order, positive word count allocations, and target aggregation.
-        Uses the dedicated CONTENT GENERATION API key with secondary key fallback.
+        Uses the dedicated CONTENT GENERATION API key with key pool rotation.
         """
         system_instruction = (
             "You are a senior document architect and engineering lead. "
@@ -976,8 +1020,24 @@ class AIService:
             "\nPlease generate the adapted Project Report outline in JSON format adhering strictly to the response schema."
         )
 
+        # Deterministic session for outline checkpoint (includes user_id)
+        session_id = _deterministic_session_id(
+            "outline", user_id, request.context.project_title,
+            ",".join(request.context.domain),
+            str(request.target_total_words or 3000)
+        )
+
+        # Check for cached outline
+        cached_outline = _checkpoint_load(session_id, "04_report_outline")
+        if cached_outline:
+            logger.info(f"[Outline Resume] Session {session_id} | Reusing cached outline")
+            try:
+                return ProjectReportOutlineResponse(**cached_outline)
+            except Exception:
+                logger.warning("[Outline Resume] Cached outline invalid, regenerating...")
+
         try:
-            raw_content = self._chat_completion_with_content_fallback(
+            raw_content, key_idx = self._generation_rotation(
                 model=self.gemini_model,
                 messages=[
                     {"role": "system", "content": system_instruction},
@@ -987,6 +1047,7 @@ class AIService:
                 max_retries=5,
                 stage="project_report_outline",
                 use_json_mode=True,
+                session_id=session_id,
             )
 
             if not raw_content:
@@ -1012,6 +1073,11 @@ class AIService:
             outline.project_title = request.context.project_title
             outline.target_total_words = total_words
 
+            # Save outline checkpoint
+            outline_dict = outline.model_dump() if hasattr(outline, "model_dump") else outline.dict()
+            _checkpoint_save(session_id, "04_report_outline", outline_dict,
+                             api_pool="content", api_key_index=key_idx)
+
             return outline
 
         except (APIError, RateLimitError, AuthenticationError) as oe:
@@ -1028,24 +1094,27 @@ class AIService:
 
     def generate_project_report_sections(
         self,
-        request: Any
+        request: Any,
+        user_id: Optional[str] = None,
     ) -> Any:
         """
         Sequentially generates publication-grade section prose for a Project Report using Gemini.
-        
+
         CHECKPOINT SYSTEM:
-        - Creates a unique session_id for each generation run
+        - Creates a DETERMINISTIC session_id from user_id + project title + section titles
+          so retries after failures find and resume from existing checkpoints.
         - Saves each section draft as a JSON checkpoint after successful generation
         - On key exhaustion (429/quota), saves progress and rotates to the next key
         - Previously drafted sections are preserved and reused from checkpoints
-        
+        - A 'failed' checkpoint is treated as incomplete and regenerated
+
         KEY ROTATION:
-        - Uses _chat_completion_with_key_rotation for each section
-        - If a key fails mid-section, the try-catch catches it and retries with next key
-        - All 6 keys are tried before giving up
+        - Uses _generation_rotation for each section through the CONTENT POOL (4 keys)
+        - Key start index is per-session (loaded from checkpoint metadata)
+        - If a key fails mid-section, catches the error, logs progress, and raises so
+          the caller can retry -- on retry, completed section checkpoints are found and skipped
         """
         model_name = self.gemini_model
-        session_id = str(uuid.uuid4())[:12]  # Compact session ID for checkpoint folder
 
         ctx = None
         project_title = "Project Report"
@@ -1072,19 +1141,36 @@ class AIService:
             project_title = ctx.get("project_title", "Project Report") if isinstance(ctx, dict) else "Project Report"
             sections_list = ctx.get("suggested_sections") if isinstance(ctx, dict) else []
 
+        # -- Build deterministic session ID from user_id + project title + section titles --
+        section_titles_str = ",".join(
+            getattr(s, "title", "") or (s.get("title", "") if isinstance(s, dict) else "")
+            for s in (sections_list or [])
+        )
+        session_id = _deterministic_session_id("gen", user_id, project_title, section_titles_str)
+
         logger.info(
             f"[Generation Checkpoint] Starting session {session_id} | "
             f"Project: {project_title} | Sections: {len(sections_list)} | "
             f"Generation pool size: {len(settings.generation_key_pool)}"
         )
 
+        # ── Check for existing completed final result ──
+        cached_final = _checkpoint_load(session_id, "99_final_result")
+        if cached_final and cached_final.get("status") == "completed":
+            logger.info(f"[Generation Resume] Session {session_id} | Found completed final result, reassembling...")
+            # Reassemble from section checkpoints
+            return self._reassemble_from_checkpoints(
+                session_id, sections_list, project_title, request
+            )
+
         # Save the initial request context as checkpoint
-        _checkpoint_save(session_id, "00_session_metadata", {
-            "project_title": project_title,
-            "tone": tone,
-            "total_sections": len(sections_list),
-            "generation_pool_size": len(settings.generation_key_pool),
-        })
+        if not _checkpoint_load(session_id, "00_session_metadata"):
+            _checkpoint_save(session_id, "00_session_metadata", {
+                "project_title": project_title,
+                "tone": tone,
+                "total_sections": len(sections_list),
+                "generation_pool_size": len(settings.generation_key_pool),
+            }, api_pool="content")
 
         sections_drafted = []
         previous_summaries = []
@@ -1113,7 +1199,10 @@ class AIService:
             step_name = f"section_{sec_index:02d}_{sec_id}"
             cached_data = _checkpoint_load(session_id, step_name)
             if cached_data:
-                logger.info(f"[Checkpoint] Reusing cached section: {sec_title}")
+                logger.info(
+                    f"[Checkpoint Resume] SKIPPING section {sec_index + 1}/{len(sections_list)}: "
+                    f"'{sec_title}' (already completed)"
+                )
                 sections_drafted.append(SectionDraft(
                     section_id=cached_data["section_id"],
                     title=cached_data["title"],
@@ -1155,15 +1244,16 @@ class AIService:
 
             # ── Try-catch with GENERATION POOL rotation for each section ──
             try:
-                raw_content = self._generation_rotation(
+                raw_content, key_idx = self._generation_rotation(
                     model=model_name,
                     messages=messages,
                     temperature=0.3,
                     max_retries=5,
                     stage=f"draft_section_{sec_title}",
+                    session_id=session_id,
                 )
             except Exception as e:
-                # Save progress checkpoint before raising
+                # Save progress checkpoint as 'failed' before raising
                 logger.error(
                     f"[Section Generation] Failed on section {sec_index + 1}/{len(sections_list)} "
                     f"'{sec_title}' after exhausting all keys: {e}"
@@ -1177,7 +1267,7 @@ class AIService:
                         {"section_id": s.section_id, "title": s.title, "word_count": s.word_count}
                         for s in sections_drafted
                     ],
-                })
+                }, api_pool="content", status="failed")
                 raise
 
             if not raw_content:
@@ -1213,38 +1303,42 @@ class AIService:
 
             # ── Save checkpoint after each successful section ──
             _checkpoint_save(session_id, step_name, {
+                "session_id": session_id,
                 "section_id": sec_id,
+                "section_title": sec_title,
                 "title": sec_title,
+                "status": "completed",
                 "content_html": cleaned_html,
                 "word_count": word_count,
                 "key_takeaways": key_takeaways,
                 "summary": summary_line,
-            })
+            }, api_pool="content", api_key_index=key_idx)
 
             logger.info(
                 f"[Section Generation] Completed {sec_index + 1}/{len(sections_list)}: "
-                f"'{sec_title}' ({word_count} words) | Session: {session_id}"
+                f"'{sec_title}' ({word_count} words) | Session: {session_id} | Key: {key_idx + 1}"
             )
 
+        # ── All sections complete — assemble final report ──
         combined_parts = [f'<h2 id="{s.section_id}">{s.title}</h2>\n{s.content_html}' for s in sections_drafted]
         combined_html = "\n\n".join(combined_parts)
         total_word_count = sum(s.word_count for s in sections_drafted)
 
         # Save final result checkpoint
         _checkpoint_save(session_id, "99_final_result", {
+            "session_id": session_id,
             "project_title": project_title,
+            "document_type": "project_report",
             "total_word_count": total_word_count,
             "sections_count": len(sections_drafted),
+            "all_sections_completed": True,
             "status": "completed",
-        })
+        }, api_pool="content")
 
         logger.info(
             f"[Section Generation] ✓ Session {session_id} completed | "
             f"{len(sections_drafted)} sections | {total_word_count} total words"
         )
-
-        # Clean up checkpoints on success (optional — keep for debugging)
-        # _checkpoint_cleanup(session_id)
 
         if isinstance(request, GenerateProjectReportSectionsRequest):
             old_drafts = [
@@ -1272,7 +1366,63 @@ class AIService:
             sections=sections_drafted,
         )
 
-    # ─── Single Section Regeneration ───
+    def _reassemble_from_checkpoints(
+        self,
+        session_id: str,
+        sections_list: list,
+        project_title: str,
+        request: Any
+    ) -> Any:
+        """
+        Reassembles a complete report from existing section checkpoint files.
+        Used when the final checkpoint exists, indicating all sections were previously completed.
+        """
+        sections_drafted = []
+        for sec_index, sec in enumerate(sections_list):
+            sec_id = getattr(sec, "section_id", None) or (sec.get("section_id") if isinstance(sec, dict) else f"sec-{sec_index+1}")
+            step_name = f"section_{sec_index:02d}_{sec_id}"
+            cached_data = _checkpoint_load(session_id, step_name)
+            if cached_data:
+                sections_drafted.append(SectionDraft(
+                    section_id=cached_data["section_id"],
+                    title=cached_data["title"],
+                    content_html=cached_data["content_html"],
+                    word_count=cached_data["word_count"],
+                ))
+            else:
+                logger.warning(f"[Reassemble] Missing checkpoint for {step_name} in session {session_id}")
+
+        combined_parts = [f'<h2 id="{s.section_id}">{s.title}</h2>\n{s.content_html}' for s in sections_drafted]
+        combined_html = "\n\n".join(combined_parts)
+        total_word_count = sum(s.word_count for s in sections_drafted)
+
+        if isinstance(request, GenerateProjectReportSectionsRequest):
+            old_drafts = [
+                ProjectReportSectionDraft(
+                    section_id=s.section_id,
+                    title=s.title,
+                    order=idx+1,
+                    content_html=s.content_html,
+                    word_count=s.word_count,
+                    key_takeaways=[]
+                )
+                for idx, s in enumerate(sections_drafted)
+            ]
+            return GenerateProjectReportSectionsResponse(
+                project_title=project_title,
+                total_word_count=total_word_count,
+                sections=old_drafts,
+                combined_html=combined_html,
+            )
+
+        return GenerateSectionsResponse(
+            project_title=project_title,
+            total_word_count=total_word_count,
+            combined_html=combined_html,
+            sections=sections_drafted,
+        )
+
+    # --- Single Section Regeneration ---
 
     def regenerate_single_section(
         self,
@@ -1280,11 +1430,15 @@ class AIService:
         current_content: str,
         user_feedback: str,
         project_context: Optional[Any] = None,
+        user_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+        sec_index: Optional[int] = None,
     ) -> RegenerateSectionResponse:
         """
         Allows rewriting a single section without re-running the entire report using Gemini.
-        Cleans output of markdown backticks or ```html fences before returning.
-        Uses the dedicated CONTENT GENERATION API key with secondary key fallback.
+        ALWAYS generates fresh content (never reads from cache).
+        Overwrites the existing section checkpoint so future resumes use the regenerated version.
+        Uses the dedicated CONTENT GENERATION API key with key pool rotation.
         """
         model_name = self.gemini_model
 
@@ -1318,6 +1472,8 @@ class AIService:
             {"role": "system", "content": system_instruction},
             {"role": "user", "content": user_prompt},
         ]
+
+        # ALWAYS call the API -- never check cache for regeneration
         raw_content = self._chat_completion_with_content_fallback(
             model=model_name,
             messages=messages,
@@ -1329,12 +1485,27 @@ class AIService:
         if not raw_content:
             raise RuntimeError(f"Failed to regenerate section content for section '{title}'.")
 
-
         cleaned_html = re.sub(r"^```(?:html)?\s*", "", raw_content.strip(), flags=re.IGNORECASE)
         cleaned_html = re.sub(r"\s*```$", "", cleaned_html).strip()
         cleaned_html = re.sub(r'^\s*<h2[^>]*>.*?</h2>\s*', '', cleaned_html, flags=re.IGNORECASE | re.DOTALL)
 
         word_count = _calculate_html_word_count(cleaned_html)
+
+        # Overwrite the existing section checkpoint so future resumes use regenerated content
+        if session_id and sec_index is not None:
+            step_name = f"section_{sec_index:02d}_{sec_id}"
+            _checkpoint_save(session_id, step_name, {
+                "session_id": session_id,
+                "section_id": sec_id,
+                "section_title": title,
+                "title": title,
+                "status": "completed",
+                "content_html": cleaned_html,
+                "word_count": word_count,
+                "regenerated": True,
+                "user_feedback": user_feedback[:200],
+            }, api_pool="content")
+            logger.info(f"[Regeneration] Overwrote checkpoint {step_name} for session {session_id}")
 
         return RegenerateSectionResponse(
             section_id=sec_id,
@@ -1352,7 +1523,7 @@ class AIService:
         """
         Generates a structured, hierarchical document outline with deterministic section IDs
         and word count estimates using Gemini.
-        Uses the dedicated CONTENT GENERATION API key with secondary key fallback.
+        Uses the dedicated CONTENT GENERATION API key with key pool rotation.
         """
         system_instruction = (
             "You are an expert academic writer, document architect, and technical editor. "
@@ -1446,7 +1617,7 @@ class AIService:
         Drafts publication-grade content for a specific document section using Gemini.
         Generates clean TipTap-compatible HTML, Markdown, word count, and key takeaways.
         Supports both DraftSectionRequest objects and direct keyword arguments.
-        Uses the dedicated CONTENT GENERATION API key with secondary key fallback.
+        Uses the dedicated CONTENT GENERATION API key with key pool rotation.
         """
         model_name = self.gemini_model
 
@@ -1562,7 +1733,7 @@ class AIService:
         """
         Executes a minimal diagnostic test request to Gemini to verify API connectivity.
         Kept as test_mistral_minimal for backward compatibility with test scripts.
-        Uses the dedicated CONTENT GENERATION API key with secondary key fallback.
+        Uses the dedicated CONTENT GENERATION API key with key pool rotation.
         """
         model = self.gemini_model
         messages = [

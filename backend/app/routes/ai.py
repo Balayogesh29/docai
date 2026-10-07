@@ -289,7 +289,8 @@ def generate_project_report_outline(
     Returns ordered sections with descriptions, DOM-friendly section IDs, and allocated word counts.
     """
     try:
-        response = ai_service.generate_project_report_outline(request)
+        user_id = user.get("uid")
+        response = ai_service.generate_project_report_outline(request, user_id=user_id)
         return response
     except ValueError as ve:
         logger.error(f"Configuration error in AI project outline generation: {ve}")
@@ -331,7 +332,8 @@ def generate_project_report_sections(
         )
 
     try:
-        response = ai_service.generate_project_report_sections(request)
+        user_id = user.get("uid")
+        response = ai_service.generate_project_report_sections(request, user_id=user_id)
         return response
     except ValueError as ve:
         logger.error(f"Configuration error in AI project section drafting: {ve}")
