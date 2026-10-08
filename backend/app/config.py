@@ -53,7 +53,15 @@ class Settings:
 
     @property
     def GEMINI_CONTENT_API_KEY(self) -> str:
-        return self.GEMINI_CONTENT_API_KEYS[0]
+        return self.GEMINI_CONTENT_API_KEYS[0] if self.GEMINI_CONTENT_API_KEYS else ""
+
+    @property
+    def GEMINI_CONTENT_API_KEY_1(self) -> str:
+        return self.GEMINI_CONTENT_API_KEYS[0] if self.GEMINI_CONTENT_API_KEYS else ""
+
+    @property
+    def GEMINI_CONTENT_API_KEY_2(self) -> str:
+        return self.GEMINI_CONTENT_API_KEYS[1] if len(self.GEMINI_CONTENT_API_KEYS) > 1 else ""
 
     GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
     GEMINI_BASE_URL: str = os.getenv("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/")
@@ -66,7 +74,12 @@ class Settings:
     @property
     def effective_content_api_key(self) -> str:
         """Returns the primary content generation API key, falling back to the generic key."""
-        return (self.GEMINI_CONTENT_API_KEYS[0].strip() or self.GEMINI_API_KEY.strip())
+        return (self.GEMINI_CONTENT_API_KEYS[0].strip() or self.GEMINI_API_KEY.strip()) if self.GEMINI_CONTENT_API_KEYS else self.GEMINI_API_KEY.strip()
+
+    @property
+    def effective_content_api_key_2(self) -> str:
+        """Returns the secondary content generation API key, falling back to primary content key."""
+        return (self.GEMINI_CONTENT_API_KEY_2.strip() or self.effective_content_api_key)
 
     def _is_valid_key(self, key: str) -> bool:
         return bool(key and key.strip() and key.strip() != "demo_key_placeholder")

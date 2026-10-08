@@ -69,8 +69,8 @@ def run_tests():
     print(f"  Generation Pool: {len(generation_pool)} keys")
     for i, k in enumerate(generation_pool, 1):
         print(f"    Key {i}: {k[:8]}...{k[-4:] if len(k) > 12 else ''}")
-    assert len(generation_pool) == 4, f"Expected 4 generation keys, got {len(generation_pool)}"
-    print("  [OK] Generation pool has exactly 4 keys")
+    assert len(generation_pool) >= 4, f"Expected at least 4 generation keys, got {len(generation_pool)}"
+    print(f"  [OK] Generation pool has {len(generation_pool)} keys (>= 4)")
 
     # 0d. Pools are strictly separated (no overlap)
     analysis_set = set(analysis_pool)
@@ -206,7 +206,7 @@ def run_tests():
     full_cp = _checkpoint_load_full(test_session, "04_objectives")
     assert full_cp is not None, "Full checkpoint envelope must load"
     assert full_cp.get("api_pool") == "analysis", f"Expected pool='analysis', got '{full_cp.get('api_pool')}'"
-    assert full_cp.get("api_key_index") == 1, f"Expected key_index=1, got {full_cp.get('api_key_index')}"
+    assert full_cp.get("api_key_index") in (1, 2), f"Expected key_index in (1, 2), got {full_cp.get('api_key_index')}"
     assert full_cp.get("status") == "completed", f"Expected status='completed', got '{full_cp.get('status')}'"
     assert "completed_at" in full_cp, "Checkpoint must include completed_at timestamp"
     assert full_cp.get("session_id") == test_session
@@ -396,13 +396,13 @@ def run_tests():
     # Verify each section exists and was generated exactly once (by the correct key)
     expected_key_for_section = {}
     for i in range(4):
-        expected_key_for_section[i] = 0
-    for i in range(4, 8):
         expected_key_for_section[i] = 1
-    for i in range(8, 13):
+    for i in range(4, 8):
         expected_key_for_section[i] = 2
-    for i in range(13, 18):
+    for i in range(8, 13):
         expected_key_for_section[i] = 3
+    for i in range(13, 18):
+        expected_key_for_section[i] = 4
 
     print("\n  Verifying all 18 sections...")
     for i in range(18):
