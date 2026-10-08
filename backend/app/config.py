@@ -33,7 +33,7 @@ class Settings:
     FIREBASE_STORAGE_BUCKET: str = os.getenv("FIREBASE_STORAGE_BUCKET", "")
     FIREBASE_SERVICE_ACCOUNT_PATH: str = os.getenv("FIREBASE_SERVICE_ACCOUNT_PATH", "./firebase-service-account.json")
 
-    # ─── Gemini: 6-Key Split Pool ───
+    # ─── Gemini: Split Pool ───
     # Legacy / fallback single key (used if specific keys are absent)
     GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
 
@@ -41,11 +41,10 @@ class Settings:
     GEMINI_ANALYSIS_API_KEY_1: str = os.getenv("GEMINI_ANALYSIS_API_KEY_1", os.getenv("GEMINI_ANALYSIS_API_KEY", ""))
     GEMINI_ANALYSIS_API_KEY_2: str = os.getenv("GEMINI_ANALYSIS_API_KEY_2", "")
 
-    # GENERATION POOL — Keys 3-6 / Content Keys 1-4 (outline generation, section drafting, regeneration)
-    GEMINI_CONTENT_API_KEY_1: str = os.getenv("GEMINI_CONTENT_API_KEY_1", os.getenv("GEMINI_CONTENT_API_KEY", ""))
-    GEMINI_CONTENT_API_KEY_2: str = os.getenv("GEMINI_CONTENT_API_KEY_2", "")
-    GEMINI_CONTENT_API_KEY_3: str = os.getenv("GEMINI_CONTENT_API_KEY_3", os.getenv("GEMINI_API_KEY_5", ""))
-    GEMINI_CONTENT_API_KEY_4: str = os.getenv("GEMINI_CONTENT_API_KEY_4", os.getenv("GEMINI_API_KEY_6", ""))
+    # GENERATION POOL — Keys 1-18 (outline generation, section drafting, regeneration)
+    GEMINI_CONTENT_API_KEYS = [
+        os.getenv(f"GEMINI_CONTENT_API_KEY_{i}", "") for i in range(1, 19)
+    ]
 
     # Aliases for backward compatibility
     @property
@@ -54,17 +53,9 @@ class Settings:
 
     @property
     def GEMINI_CONTENT_API_KEY(self) -> str:
-        return self.GEMINI_CONTENT_API_KEY_1
+        return self.GEMINI_CONTENT_API_KEYS[0]
 
-    @property
-    def GEMINI_API_KEY_5(self) -> str:
-        return self.GEMINI_CONTENT_API_KEY_3
-
-    @property
-    def GEMINI_API_KEY_6(self) -> str:
-        return self.GEMINI_CONTENT_API_KEY_4
-
-    GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
+    GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
     GEMINI_BASE_URL: str = os.getenv("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/")
 
     @property
@@ -75,12 +66,7 @@ class Settings:
     @property
     def effective_content_api_key(self) -> str:
         """Returns the primary content generation API key, falling back to the generic key."""
-        return (self.GEMINI_CONTENT_API_KEY_1.strip() or self.GEMINI_API_KEY.strip())
-
-    @property
-    def effective_content_api_key_2(self) -> str:
-        """Returns the secondary content generation API key, falling back to primary content key."""
-        return (self.GEMINI_CONTENT_API_KEY_2.strip() or self.effective_content_api_key)
+        return (self.GEMINI_CONTENT_API_KEYS[0].strip() or self.GEMINI_API_KEY.strip())
 
     def _is_valid_key(self, key: str) -> bool:
         return bool(key and key.strip() and key.strip() != "demo_key_placeholder")
@@ -103,7 +89,6 @@ class Settings:
         """
         ANALYSIS POOL: Keys 1-2 only.
         Used exclusively for context analysis and project context analysis.
-        If both analysis keys are exhausted, does NOT spill into generation keys.
         """
         return self._build_pool([
             self.GEMINI_ANALYSIS_API_KEY_1,
@@ -113,16 +98,10 @@ class Settings:
     @property
     def generation_key_pool(self) -> list:
         """
-        GENERATION POOL: Keys 3-6 (Content Keys 1-4) only.
+        GENERATION POOL: Keys 1-18 only.
         Used exclusively for outline generation, section drafting, and regeneration.
-        If all generation keys are exhausted, does NOT spill into analysis keys.
         """
-        return self._build_pool([
-            self.GEMINI_CONTENT_API_KEY_1,
-            self.GEMINI_CONTENT_API_KEY_2,
-            self.GEMINI_CONTENT_API_KEY_3,
-            self.GEMINI_CONTENT_API_KEY_4,
-        ])
+        return self._build_pool(self.GEMINI_CONTENT_API_KEYS)
 
     @property
     def key_pool(self) -> list:
@@ -132,12 +111,7 @@ class Settings:
         return self._build_pool([
             self.GEMINI_ANALYSIS_API_KEY_1,
             self.GEMINI_ANALYSIS_API_KEY_2,
-            self.GEMINI_CONTENT_API_KEY_1,
-            self.GEMINI_CONTENT_API_KEY_2,
-            self.GEMINI_CONTENT_API_KEY_3,
-            self.GEMINI_CONTENT_API_KEY_4,
-            self.GEMINI_API_KEY,
-        ])
+        ] + self.GEMINI_CONTENT_API_KEYS + [self.GEMINI_API_KEY])
 
     # ─── Configuration Checks ───
 
@@ -192,11 +166,9 @@ _logger.info(f"  ── ANALYSIS POOL (Keys 1-2) ──")
 _logger.info(f"  Analysis key 1:     {settings._is_valid_key(settings.GEMINI_ANALYSIS_API_KEY_1)}")
 _logger.info(f"  Analysis key 2:     {settings._is_valid_key(settings.GEMINI_ANALYSIS_API_KEY_2)}")
 _logger.info(f"  Analysis pool size: {len(settings.analysis_key_pool)} keys")
-_logger.info(f"  ── GENERATION POOL (Content Keys 1-4 / Keys 3-6) ──")
-_logger.info(f"  Content key 1:      {settings._is_valid_key(settings.GEMINI_CONTENT_API_KEY_1)}")
-_logger.info(f"  Content key 2:      {settings._is_valid_key(settings.GEMINI_CONTENT_API_KEY_2)}")
-_logger.info(f"  Content key 3:      {settings._is_valid_key(settings.GEMINI_CONTENT_API_KEY_3)}")
-_logger.info(f"  Content key 4:      {settings._is_valid_key(settings.GEMINI_CONTENT_API_KEY_4)}")
+_logger.info(f"  ── GENERATION POOL (Content Keys) ──")
+for i, key in enumerate(settings.GEMINI_CONTENT_API_KEYS, start=1):
+    _logger.info(f"  Content key {i}:      {settings._is_valid_key(key)}")
 _logger.info(f"  Generation pool:    {len(settings.generation_key_pool)} keys")
 _logger.info(f"  ── COMBINED ──")
 _logger.info(f"  Total unique keys:  {len(settings.key_pool)}")

@@ -24,7 +24,7 @@ CHECKPOINTS_DIR.mkdir(parents=True, exist_ok=True)
 if settings.GEMINI_API_KEY and not os.environ.get("OPENAI_API_KEY"):
     os.environ["OPENAI_API_KEY"] = settings.GEMINI_API_KEY
 
-from openai import OpenAI, APIError, RateLimitError, AuthenticationError
+
 from pydantic import ValidationError
 
 from app.schemas.ai import (
@@ -320,7 +320,7 @@ def get_reference_files_context(user_id: str, file_ids: List[str]) -> str:
 
 def _is_rotatable_error(exc: Exception) -> bool:
     """Returns True if the error should trigger key rotation within a pool."""
-    status_code = getattr(exc, "status_code", getattr(exc, "status", None))
+    status_code = getattr(exc, "status_code", getattr(exc, "status", getattr(exc, "code", getattr(exc, "code_", None))))
     error_body = getattr(exc, "body", getattr(exc, "message", str(exc)))
     error_str = str(error_body).lower() if error_body else ""
 
@@ -336,7 +336,7 @@ def _is_rotatable_error(exc: Exception) -> bool:
 
 def _is_quota_error(exc: Exception) -> bool:
     """Returns True if the error is specifically a quota/rate-limit exhaustion."""
-    status_code = getattr(exc, "status_code", getattr(exc, "status", None))
+    status_code = getattr(exc, "status_code", getattr(exc, "status", getattr(exc, "code", getattr(exc, "code_", None))))
     error_body = getattr(exc, "body", getattr(exc, "message", str(exc)))
     error_str = str(error_body).lower() if error_body else ""
 
@@ -379,54 +379,38 @@ class AIService:
 
     # ─── Client Creation ───
 
-    def get_analysis_client(self) -> OpenAI:
+    def get_analysis_client(self) -> Any:
         """
-        Returns an OpenAI SDK client for analysis tasks (context analysis, project context analysis)
-        using the dedicated analysis API key.
+        Returns a LangChain client for analysis tasks.
         """
         if not settings.is_analysis_key_configured:
-            raise ValueError(
-                "Gemini Analysis API key is not configured. "
-                "Set GEMINI_ANALYSIS_API_KEY in your .env file. "
-                "Get a key at https://aistudio.google.com/apikey"
-            )
-        logger.info(
-            f"[Gemini Analysis Client] Using analysis key | "
-            f"Model: {settings.GEMINI_MODEL} | Base URL: {settings.GEMINI_BASE_URL}"
-        )
-        return OpenAI(
-            api_key=settings.effective_analysis_api_key,
-            base_url=settings.GEMINI_BASE_URL,
+            raise ValueError("Gemini Analysis API key is not configured.")
+        from langchain_google_genai import ChatGoogleGenAI
+        return ChatGoogleGenAI(
+            model=settings.GEMINI_MODEL,
+            google_api_key=settings.effective_analysis_api_key,
+            temperature=0.2,
+            max_retries=0
         )
 
-    def get_content_client(self) -> OpenAI:
+    def get_content_client(self) -> Any:
         """
-        Returns an OpenAI SDK client for content generation tasks (outline, drafting, regeneration)
-        using the dedicated content generation API key.
+        Returns a LangChain client for content generation tasks.
         """
         if not settings.is_content_key_configured:
-            raise ValueError(
-                "Gemini Content API key is not configured. "
-                "Set GEMINI_CONTENT_API_KEY in your .env file. "
-                "Get a key at https://aistudio.google.com/apikey"
-            )
-        logger.info(
-            f"[Gemini Content Client] Using primary content key | "
-            f"Model: {settings.GEMINI_MODEL} | Base URL: {settings.GEMINI_BASE_URL}"
-        )
-        return OpenAI(
-            api_key=settings.effective_content_api_key,
-            base_url=settings.GEMINI_BASE_URL,
+            raise ValueError("Gemini Content API key is not configured.")
+        from langchain_google_genai import ChatGoogleGenAI
+        return ChatGoogleGenAI(
+            model=settings.GEMINI_MODEL,
+            google_api_key=settings.effective_content_api_key,
+            temperature=0.3,
+            max_retries=0
         )
 
-    def get_gemini_openai_client(self) -> OpenAI:
-        """
-        Legacy compatibility method — routes to content client by default.
-        """
+    def get_gemini_openai_client(self) -> Any:
         return self.get_content_client()
 
     def get_gemini_client(self):
-        """Returns native google.genai Client for Gemini (used for visual/diagram features)."""
         if settings.is_gemini_configured:
             try:
                 from google import genai
@@ -435,15 +419,13 @@ class AIService:
                 logger.warning(f"Failed to initialize native Gemini Client: {e}")
         return None
 
-    def get_client(self) -> OpenAI:
+    def get_client(self) -> Any:
         return self.get_gemini_openai_client()
 
-    def _client_for_key(self, api_key: str) -> OpenAI:
-        """Creates an OpenAI SDK client for any arbitrary API key in the pool."""
-        return OpenAI(
-            api_key=api_key,
-            base_url=settings.GEMINI_BASE_URL,
-        )
+    def _client_for_key(self, api_key: str, model: str, temperature: float) -> Any:
+        """Creates a Langchain client for any arbitrary API key in the pool."""
+        from langchain_google_genai import ChatGoogleGenAI
+        return ChatGoogleGenAI(model=model, google_api_key=api_key, temperature=temperature, max_retries=0)
 
     # ─── Pool-Based Key Rotation ───
     # Two dedicated pools: analysis (keys 1-2) and generation (keys 3-6).
@@ -485,7 +467,7 @@ class AIService:
             masked = f"{key[:6]}...{key[-4:]}" if len(key) > 10 else "[SHORT]"
 
             try:
-                client = self._client_for_key(key)
+                client = self._client_for_key(key, model, temperature)
                 logger.info(
                     f"[{pool_name}] Trying key {key_index + 1}/{len(pool)} "
                     f"({masked}) for stage '{stage}' | model: {model}"
@@ -549,23 +531,21 @@ class AIService:
 
         for attempt in range(1, max_retries + 1):
             try:
-                kwargs = dict(
-                    model=model,
-                    messages=messages,
-                    temperature=temperature,
-                )
+                from langchain_core.messages import SystemMessage, HumanMessage
+                lc_messages = []
+                for m in messages:
+                    if m["role"] == "system":
+                        lc_messages.append(SystemMessage(content=m["content"]))
+                    else:
+                        lc_messages.append(HumanMessage(content=m["content"]))
+                
                 if use_json_mode:
-                    kwargs["response_format"] = {"type": "json_object"}
+                    client_bound = client.bind(response_mime_type="application/json")
+                    response = client_bound.invoke(lc_messages)
+                else:
+                    response = client.invoke(lc_messages)
 
-                response = client.chat.completions.create(**kwargs)
-                content = response.choices[0].message.content
-
-                if isinstance(content, list):
-                    content = "".join(
-                        [c.text if hasattr(c, "text") else str(c) for c in content]
-                    )
-
-                return content or ""
+                return response.content or ""
 
             except Exception as e:
                 last_exception = e
@@ -780,10 +760,7 @@ class AIService:
 
             return result
 
-        except (APIError, RateLimitError, AuthenticationError) as oe:
-            _checkpoint_save(session_id, "failure_context_analysis", {"error": str(oe)}, api_pool="analysis", status="failed")
-            logger.error(f"[AI Context Analysis Error]: {oe}", exc_info=True)
-            raise oe
+
         except ValidationError as ve:
             logger.error(f"[AI Context Analysis Error] Pydantic validation error: {ve}", exc_info=True)
             raise RuntimeError(f"Failed to parse AI output into valid ContextAnalysisResponse: {ve}")
@@ -960,10 +937,7 @@ class AIService:
 
             return result
 
-        except (APIError, RateLimitError, AuthenticationError) as oe:
-            _checkpoint_save(session_id, "failure_project_context", {"error": str(oe)}, api_pool="analysis", status="failed")
-            logger.error(f"[AI Project Context Error]: {oe}", exc_info=True)
-            raise oe
+
         except ValidationError as ve:
             _checkpoint_save(session_id, "failure_project_context", {"error": str(ve)}, api_pool="analysis", status="failed")
             logger.error(f"[AI Project Context Error] Pydantic validation error: {ve}", exc_info=True)
@@ -1080,9 +1054,7 @@ class AIService:
 
             return outline
 
-        except (APIError, RateLimitError, AuthenticationError) as oe:
-            logger.error(f"[AI Project Outline Error]: {oe}", exc_info=True)
-            raise oe
+
         except ValidationError as ve:
             logger.error(f"[AI Project Outline Error] Pydantic validation error: {ve}", exc_info=True)
             raise RuntimeError(f"Failed to parse AI output into valid ProjectReportOutlineResponse: {ve}")
@@ -1591,9 +1563,7 @@ class AIService:
 
             return outline
 
-        except (APIError, RateLimitError, AuthenticationError) as oe:
-            logger.error(f"[AI Outline Generation Error]: {oe}", exc_info=True)
-            raise oe
+
         except ValidationError as ve:
             logger.error(f"[AI Outline Generation Error] Pydantic validation error: {ve}", exc_info=True)
             raise RuntimeError(f"Failed to parse AI output into valid OutlineGenerationResponse: {ve}")
@@ -1720,9 +1690,7 @@ class AIService:
                 word_count=word_count,
                 key_takeaways=key_takeaways,
             )
-        except (APIError, RateLimitError, AuthenticationError) as oe:
-            logger.error(f"[AI Router] Section draft failed for {sec_name_str}: {oe}")
-            raise oe
+
         except Exception as e:
             logger.error(f"[AI Router] Section draft failed for {sec_name_str}: {e}")
             raise e

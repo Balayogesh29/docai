@@ -5,7 +5,7 @@ from openai import OpenAI
 
 load_dotenv()
 base_url = os.getenv("GEMINI_BASE_URL", "https://generativelanguage.googleapis.com/v1beta/openai/")
-model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+model = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 
 keys = {
     "GEMINI_ANALYSIS_API_KEY": os.getenv("GEMINI_ANALYSIS_API_KEY"),
@@ -26,7 +26,7 @@ for name, k in keys.items():
     masked = f"{k[:6]}...{k[-4:]}"
     print(f"\n--- Testing {name} ({masked}) ---", flush=True)
     client = OpenAI(api_key=k, base_url=base_url)
-    for test_model in [model, "gemini-2.5-flash", "gemini-1.5-flash", "gemini-2.0-flash", "gemini-1.5-pro", "gemini-2.5-pro"]:
+    for test_model in [model, "gemini-3.8-flash"]:
         try:
             print(f"  Attempting model '{test_model}'...", end="", flush=True)
             res = client.chat.completions.create(
